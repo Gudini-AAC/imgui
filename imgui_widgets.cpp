@@ -4258,7 +4258,7 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
 
         // We allow validate/cancel with Nav source (gamepad) to makes it easier to undo an accidental NavInput press with no keyboard wired, but otherwise it isn't very useful.
         const bool is_validate = IsKeyPressedMap(ImGuiKey_Enter) || IsKeyPressedMap(ImGuiKey_KeyPadEnter) || IsNavInputTest(ImGuiNavInput_Activate, ImGuiInputReadMode_Pressed) || IsNavInputTest(ImGuiNavInput_Input, ImGuiInputReadMode_Pressed);
-        const bool is_cancel   = IsKeyPressedMap(ImGuiKey_Escape) || IsNavInputTest(ImGuiNavInput_Cancel, ImGuiInputReadMode_Pressed);
+        const bool is_cancel   = (IsKeyPressedMap(ImGuiKey_Escape) || IsNavInputTest(ImGuiNavInput_Cancel, ImGuiInputReadMode_Pressed)) && (flags & ImGuiInputTextFlags_CallbackEscape) == 0;
 
         if (IsKeyPressedMap(ImGuiKey_LeftArrow))                        { state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_LINESTART : is_wordmove_key_down ? STB_TEXTEDIT_K_WORDLEFT : STB_TEXTEDIT_K_LEFT) | k_mask); }
         else if (IsKeyPressedMap(ImGuiKey_RightArrow))                  { state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_LINEEND : is_wordmove_key_down ? STB_TEXTEDIT_K_WORDRIGHT : STB_TEXTEDIT_K_RIGHT) | k_mask); }
@@ -4367,23 +4367,6 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         IM_ASSERT(state != NULL);
         const char* apply_new_text = NULL;
         int apply_new_text_length = 0;
-        if (cancel_edit)
-        {
-            // Restore initial value. Only return true if restoring to the initial value changes the current buffer contents.
-            if (!is_readonly && strcmp(buf, state->InitialTextA.Data) != 0)
-            {
-                // Push records into the undo stack so we can CTRL+Z the revert operation itself
-                apply_new_text = state->InitialTextA.Data;
-                apply_new_text_length = state->InitialTextA.Size - 1;
-                ImVector<ImWchar> w_text;
-                if (apply_new_text_length > 0)
-                {
-                    w_text.resize(ImTextCountCharsFromUtf8(apply_new_text, apply_new_text + apply_new_text_length) + 1);
-                    ImTextStrFromUtf8(w_text.Data, w_text.Size, apply_new_text, apply_new_text + apply_new_text_length);
-                }
-                stb_textedit_replace(state, &state->Stb, w_text.Data, (apply_new_text_length > 0) ? (w_text.Size - 1) : 0);
-            }
-        }
 
         // When using 'ImGuiInputTextFlags_EnterReturnsTrue' as a special case we reapply the live buffer back to the input buffer before clearing ActiveId, even though strictly speaking it wasn't modified on this frame.
         // If we didn't do that, code like InputInt() with ImGuiInputTextFlags_EnterReturnsTrue would fail.
@@ -4403,7 +4386,7 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
             }
 
             // User callback
-            if ((flags & (ImGuiInputTextFlags_CallbackCompletion | ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CallbackEdit | ImGuiInputTextFlags_CallbackAlways)) != 0)
+            if ((flags & (ImGuiInputTextFlags_CallbackCompletion | ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CallbackEdit | ImGuiInputTextFlags_CallbackAlways | ImGuiInputTextFlags_CallbackEscape)) != 0)
             {
                 IM_ASSERT(callback != NULL);
 
@@ -4424,6 +4407,11 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                 {
                     event_flag = ImGuiInputTextFlags_CallbackHistory;
                     event_key = ImGuiKey_DownArrow;
+                }
+                else if ((flags & ImGuiInputTextFlags_CallbackEscape) != 0 && IsKeyPressedMap(ImGuiKey_Escape))
+                {
+                    event_flag = ImGuiInputTextFlags_CallbackEscape;
+                    event_key = ImGuiKey_Escape;
                 }
                 else if ((flags & ImGuiInputTextFlags_CallbackEdit) && state->Edited)
                 {
@@ -4455,7 +4443,14 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                     const int utf8_selection_end = callback_data.SelectionEnd = ImTextCountUtf8BytesFromStr(text, text + state->Stb.select_end);
 
                     // Call user code
-                    callback(&callback_data);
+                    const int callback_result = callback(&callback_data);
+
+                    // If user returned true on the escape callback
+                    if (event_flag == ImGuiInputTextFlags_CallbackEscape)
+                    {
+                        if (callback_result & 1) clear_active_id = true;
+                        if (callback_result & 2) cancel_edit = true;
+                    }
 
                     // Read back what user may have modified
                     IM_ASSERT(callback_data.Buf == state->TextA.Data);  // Invalid to modify those fields
@@ -4470,8 +4465,15 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                         IM_ASSERT(callback_data.BufTextLen == (int)strlen(callback_data.Buf)); // You need to maintain BufTextLen if you change the text!
                         if (callback_data.BufTextLen > backup_current_text_length && is_resizable)
                             state->TextW.resize(state->TextW.Size + (callback_data.BufTextLen - backup_current_text_length));
-                        state->CurLenW = ImTextStrFromUtf8(state->TextW.Data, state->TextW.Size, callback_data.Buf, NULL);
-                        state->CurLenA = callback_data.BufTextLen;  // Assume correct length and valid UTF-8 from user, saves us an extra strlen()
+                        
+                        ImVector<ImWchar> w_text;
+                        int old_cursor = state->Stb.cursor;
+                        w_text.resize(callback_data.BufTextLen + 1);
+                        ImTextStrFromUtf8(w_text.Data, w_text.Size, callback_data.Buf, NULL);
+                        stb_textedit_replace(state, &state->Stb, w_text.Data, (callback_data.BufTextLen > 0) ? (w_text.Size - 1) : 0);
+                        state->Stb.cursor = old_cursor;
+                        IM_ASSERT(state->Stb.cursor <= w_text.Size);
+
                         state->CursorAnimReset();
                     }
                 }
@@ -4485,6 +4487,24 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
             }
         }
 
+        if (cancel_edit)
+        {
+            // Restore initial value. Only return true if restoring to the initial value changes the current buffer contents.
+            if (!is_readonly && strcmp(buf, state->InitialTextA.Data) != 0)
+            {
+                // Push records into the undo stack so we can CTRL+Z the revert operation itself
+                apply_new_text = state->InitialTextA.Data;
+                apply_new_text_length = state->InitialTextA.Size - 1;
+                ImVector<ImWchar> w_text;
+                if (apply_new_text_length > 0)
+                {
+                    w_text.resize(ImTextCountCharsFromUtf8(apply_new_text, apply_new_text + apply_new_text_length) + 1);
+                    ImTextStrFromUtf8(w_text.Data, w_text.Size, apply_new_text, apply_new_text + apply_new_text_length);
+                }
+                stb_textedit_replace(state, &state->Stb, w_text.Data, (apply_new_text_length > 0) ? (w_text.Size - 1) : 0);
+            }
+        }
+        
         // Copy result to user buffer
         if (apply_new_text)
         {
